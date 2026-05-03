@@ -108,12 +108,20 @@ struct ASWindowTabs {
     let name: String
     let tabs: [[String]]         // tabs[tabIndex] = [uuid, ...] (splits within tab)
     let selectedTabIndex: Int    // 0-based index of the selected/active tab
+    let position: (Int, Int)?    // top-left screen coords from `bounds of w`, nil if unavailable
 }
 
 /// Get all windows' terminal UUIDs, grouped by tab within each window.
 /// Returns one entry per window, with terminals organized per-tab.
 /// This is essential for split pane UUID resolution — splits share a tab,
 /// so we need per-tab grouping rather than per-window flattening.
+///
+/// Also captures window screen position. AS `every window` returns windows in
+/// z-order (changes with focus, cmd-tab, desktop swipe), while AX windows are
+/// sorted by stable CGWindowID. Two windows running Claude can share a stable
+/// title, so name-only matching swaps UUIDs across windows when z-order shifts.
+/// Position (top-left in screen coords) is unique among visible windows and
+/// invariant to focus changes, so it disambiguates reliably.
 private func asAllWindowTabTerminals() -> [ASWindowTabs] {
     guard let result = runAS("""
         tell application "Ghostty"
@@ -121,6 +129,14 @@ private func asAllWindowTabTerminals() -> [ASWindowTabs] {
             repeat with w in every window
                 set wName to name of w
                 set output to output & wName & "\\t"
+                -- Capture top-left position for stable AX/AS correlation.
+                -- `bounds` returns {left, top, right, bottom} in screen coords.
+                set wPos to ""
+                try
+                    set b to bounds of w
+                    set wPos to (item 1 of b as text) & "," & (item 2 of b as text)
+                end try
+                set output to output & wPos & "\\t"
                 -- Find selected tab index (0-based)
                 set selIdx to 0
                 set tabIdx to 0
@@ -148,18 +164,23 @@ private func asAllWindowTabTerminals() -> [ASWindowTabs] {
         end tell
     """), !result.isEmpty else { return [] }
 
-    // Parse "windowName\tselIdx\tuuid1,uuid2|uuid3\n..." into [ASWindowTabs]
+    // Parse "windowName\tposX,posY\tselIdx\tuuid1,uuid2|uuid3\n..." into [ASWindowTabs]
     return result.components(separatedBy: "\n")
         .filter { !$0.isEmpty }
         .compactMap { line in
             let parts = line.components(separatedBy: "\t")
-            guard parts.count == 3 else { return nil }
+            guard parts.count == 4 else { return nil }
             let name = parts[0]
-            let selIdx = Int(parts[1]) ?? 0
-            let tabs = parts[2].components(separatedBy: "|").map { tabStr in
+            var position: (Int, Int)? = nil
+            let posParts = parts[1].components(separatedBy: ",")
+            if posParts.count == 2, let x = Int(posParts[0]), let y = Int(posParts[1]) {
+                position = (x, y)
+            }
+            let selIdx = Int(parts[2]) ?? 0
+            let tabs = parts[3].components(separatedBy: "|").map { tabStr in
                 tabStr.isEmpty ? [String]() : tabStr.components(separatedBy: ",")
             }
-            return ASWindowTabs(name: name, tabs: tabs, selectedTabIndex: selIdx)
+            return ASWindowTabs(name: name, tabs: tabs, selectedTabIndex: selIdx, position: position)
         }
 }
 
@@ -835,60 +856,84 @@ private func stableWindowTitle(_ title: String) -> String {
     String(title.drop(while: { !$0.isASCII || $0.isWhitespace }).drop(while: { $0.isWhitespace }))
 }
 
-/// Match AX windows (sorted by CGWindowID) to AS windows (arbitrary order) by name.
+/// Match AX windows (sorted by CGWindowID) to AS windows (z-order) deterministically.
 /// Returns a dictionary mapping AX window key (from sortedWindowKeys) to the index
-/// into the asWindows array. Uses stable title comparison to handle spinner prefixes.
-/// Greedy: each AS window is consumed at most once.
+/// into the asWindows array. Each AS window is consumed at most once.
+///
+/// Why this is hard: AS `every window` returns z-order (changes every cmd-tab,
+/// desktop swipe, or focus shift), so positional correlation is unsafe. Names
+/// often collide — multiple windows running Claude all collapse to the same
+/// stableWindowTitle. With name-only matching plus greedy first-pick, the same
+/// AX window gets paired with whichever same-named AS window happens to be in
+/// front — UUIDs appear to "cycle" across `gx list` calls, and surfaces beyond
+/// the count get reported as "?".
+///
+/// Strategy (in order, each pass consumes from the same usedAS set):
+///   1. Position match: `bounds of window` from AS vs `kAXPositionAttribute`
+///      from AX. Top-left coords are unique per visible window and invariant
+///      to focus changes — the only fully reliable signal we have.
+///   2. Exact stable-title match (after spinner stripping).
+///   3. Partial title match (one contains the other).
+/// No terminal-count fallback: it produces wrong UUIDs silently. Better to
+/// surface a "?" in `gx list` than to mislead clients into peeking the wrong
+/// surface.
 private func matchAXtoASWindows(sortedWindowKeys: [Int],
                                  windowSurfaces: [Int: [Surface]],
                                  asWindows: [ASWindowTabs]) -> [Int: Int] {
     var result: [Int: Int] = [:]
     var usedAS = Set<Int>()
 
+    // Pass 1: position match — unique per visible window, immune to z-order.
+    // Tolerate ±1 px rounding between AS integer bounds and AX float position.
     for winKey in sortedWindowKeys {
         guard let surfaces = windowSurfaces[winKey], let firstSurface = surfaces.first else { continue }
-        let axTitle = stableWindowTitle(ax(firstSurface.window, kAXTitleAttribute as String) ?? "")
+        let (axX, axY) = axPosition(firstSurface.window)
+        // Skip if AX gave us nothing useful — fall through to title pass.
+        if axX == 0 && axY == 0 { continue }
 
-        // Find best matching AS window: same stable title, not yet consumed
-        var bestIdx: Int? = nil
         for (asIdx, asWin) in asWindows.enumerated() {
             guard !usedAS.contains(asIdx) else { continue }
-            let asTitle = stableWindowTitle(asWin.name)
-            if !axTitle.isEmpty && !asTitle.isEmpty && axTitle == asTitle {
-                bestIdx = asIdx
+            guard let pos = asWin.position else { continue }
+            if abs(Int(axX.rounded()) - pos.0) <= 1 && abs(Int(axY.rounded()) - pos.1) <= 1 {
+                result[winKey] = asIdx
+                usedAS.insert(asIdx)
                 break
             }
         }
+    }
 
-        // Fallback: partial match (one contains the other)
-        if bestIdx == nil {
-            for (asIdx, asWin) in asWindows.enumerated() {
-                guard !usedAS.contains(asIdx) else { continue }
-                let asTitle = stableWindowTitle(asWin.name)
-                if !axTitle.isEmpty && !asTitle.isEmpty &&
-                   (axTitle.contains(asTitle) || asTitle.contains(axTitle)) {
-                    bestIdx = asIdx
-                    break
-                }
+    // Pass 2: exact stable title — for windows where position was unavailable
+    // on either side (e.g. minimized, off-screen, or AS bounds query failed).
+    for winKey in sortedWindowKeys where result[winKey] == nil {
+        guard let surfaces = windowSurfaces[winKey], let firstSurface = surfaces.first else { continue }
+        let axTitle = stableWindowTitle(ax(firstSurface.window, kAXTitleAttribute as String) ?? "")
+        if axTitle.isEmpty { continue }
+
+        for (asIdx, asWin) in asWindows.enumerated() {
+            guard !usedAS.contains(asIdx) else { continue }
+            let asTitle = stableWindowTitle(asWin.name)
+            if !asTitle.isEmpty && axTitle == asTitle {
+                result[winKey] = asIdx
+                usedAS.insert(asIdx)
+                break
             }
         }
+    }
 
-        // Last resort: match by terminal count (same number of total terminals)
-        if bestIdx == nil {
-            let axCount = surfaces.count
-            for (asIdx, asWin) in asWindows.enumerated() {
-                guard !usedAS.contains(asIdx) else { continue }
-                let asCount = asWin.tabs.flatMap { $0 }.count
-                if axCount == asCount {
-                    bestIdx = asIdx
-                    break
-                }
+    // Pass 3: partial title match (substring containment).
+    for winKey in sortedWindowKeys where result[winKey] == nil {
+        guard let surfaces = windowSurfaces[winKey], let firstSurface = surfaces.first else { continue }
+        let axTitle = stableWindowTitle(ax(firstSurface.window, kAXTitleAttribute as String) ?? "")
+        if axTitle.isEmpty { continue }
+
+        for (asIdx, asWin) in asWindows.enumerated() {
+            guard !usedAS.contains(asIdx) else { continue }
+            let asTitle = stableWindowTitle(asWin.name)
+            if !asTitle.isEmpty && (axTitle.contains(asTitle) || asTitle.contains(axTitle)) {
+                result[winKey] = asIdx
+                usedAS.insert(asIdx)
+                break
             }
-        }
-
-        if let idx = bestIdx {
-            result[winKey] = idx
-            usedAS.insert(idx)
         }
     }
 
