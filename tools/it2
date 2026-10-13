@@ -1,12 +1,111 @@
 #!/bin/bash
 # it2 shim — wraps gx for Claude Code ITermBackend compatibility
 # Translates it2 CLI commands to gx equivalents for Ghostty native teammates.
+#
+# Teammate layout (the lead is the terminal in $ITERM_SESSION_ID), columns first:
+#   1 teammate     lead | t1                      (lead ½)
+#   2-8 teammates  lead | col1 | col2, alternating t1|t2, t3|t4 … (lead ⅓)
+#   9+  teammates  stacked in an overflow tab in the lead's window
+# Ghostty can only split an existing pane (no move/swap), so column 2 must be
+# opened while column 1 holds a single pane, i.e. by the 2nd teammate.
+# Placement is tracked per lead in a small state file; Claude Code's own split
+# target is ignored because it always asks to split below the last teammate.
 
 GX="${GX_BIN:-gx}"
 command -v "$GX" >/dev/null 2>&1 || { echo "it2 shim: gx not found on PATH" >&2; exit 127; }
 
+MAX_ROWS=4  # panes per column
+
 # UUID pattern (case-insensitive)
 is_uuid() { [[ "$1" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]; }
+
+ghostty_as() { /usr/bin/osascript -e 'tell application "Ghostty"' "$@" -e 'end tell'; }
+
+# Even out every split in the terminal's tab. Best effort.
+equalize() { ghostty_as -e "perform action \"equalize_splits\" on terminal id \"$1\"" >/dev/null 2>&1 || true; }
+
+# gx split <uuid> <-h|-v> → prints the new terminal UUID
+split_pane() { $GX split "$1" "$2" | awk '{print $NF}'; }
+
+# New tab in the window holding terminal $1, keeping the lead's tab selected.
+overflow_tab() {
+  ghostty_as \
+    -e 'repeat with w in windows' \
+    -e '  repeat with t in tabs of w' \
+    -e "    if (id of terminals of t) contains \"$1\" then" \
+    -e '      set nt to new tab in w' \
+    -e '      set newId to id of focused terminal of nt' \
+    -e '      select tab t' \
+    -e '      return newId' \
+    -e '    end if' \
+    -e '  end repeat' \
+    -e 'end repeat'
+}
+
+state_file() { echo "${TMPDIR:-/tmp}/it2-shim-layout-$1"; }
+
+# Equalize the lead's tab. With two side-by-side columns Ghostty's equalize
+# already gives lead, col1 and col2 a third of the width each.
+rebalance() { equalize "$1"; }
+
+# Serialize concurrent spawns per lead (Claude Code may start several at once).
+lock() {
+  local i
+  for i in $(seq 100); do mkdir "$1.lock" 2>/dev/null && return 0; sleep 0.1; done
+  rm -rf "$1.lock"; mkdir "$1.lock"
+}
+unlock() { rmdir "$1.lock" 2>/dev/null; }
+
+# Place a new teammate pane for this lead and print its UUID.
+place_teammate() {
+  local lead="$1" state alive kind id new col
+  state=$(state_file "$lead")
+  # Ask Ghostty directly: gx list shows "?" for a pane until its title is set.
+  alive=" $(ghostty_as -e 'get id of every terminal' 2>/dev/null | tr -d ',') "
+
+  # Load state top to bottom, dropping panes that no longer exist.
+  local c1=() c2=() tabs=()
+  if [[ -f "$state" ]]; then
+    while read -r kind id; do
+      [[ -n "$id" && "$alive" == *" $id "* ]] || continue
+      case "$kind" in
+        c1) c1+=("$id") ;;
+        c2) c2+=("$id") ;;
+        tab) tabs+=("$id") ;;
+      esac
+    done < "$state"
+  fi
+  # Column 1 emptied out: column 2 becomes the only column.
+  if (( ${#c1[@]} == 0 && ${#c2[@]} )); then c1=("${c2[@]}"); c2=(); fi
+
+  if (( ${#c1[@]} == 0 )); then
+    new=$(split_pane "$lead" -h) && c1+=("$new")
+  elif (( ${#c2[@]} == 0 && ${#c1[@]} == 1 )); then
+    new=$(split_pane "${c1[0]}" -h) && c2+=("$new")
+  elif (( ${#c2[@]} == 0 && ${#c1[@]} < MAX_ROWS )); then
+    # Column 2 can no longer be opened full height; keep stacking column 1.
+    new=$(split_pane "${c1[${#c1[@]}-1]}" -v) && c1+=("$new")
+  elif (( ${#c2[@]} && ${#c1[@]} <= ${#c2[@]} && ${#c1[@]} < MAX_ROWS )); then
+    new=$(split_pane "${c1[${#c1[@]}-1]}" -v) && c1+=("$new")
+  elif (( ${#c2[@]} && ${#c2[@]} < MAX_ROWS )); then
+    new=$(split_pane "${c2[${#c2[@]}-1]}" -v) && c2+=("$new")
+  elif (( ${#tabs[@]} == 0 )); then
+    new=$(overflow_tab "$lead") && tabs+=("$new")
+  else
+    new=$(split_pane "${tabs[${#tabs[@]}-1]}" -v) && tabs+=("$new")
+  fi
+  is_uuid "$new" || return 1
+
+  { for id in "${c1[@]}"; do echo "c1 $id"; done
+    for id in "${c2[@]}"; do echo "c2 $id"; done
+    for id in "${tabs[@]}"; do echo "tab $id"; done; } > "$state"
+  if (( ${#tabs[@]} )) && [[ "$new" == "${tabs[${#tabs[@]}-1]}" ]]; then
+    equalize "$new"
+  else
+    rebalance "$lead"
+  fi
+  echo "$new"
+}
 
 case "$1" in
   session)
@@ -25,19 +124,29 @@ case "$1" in
         ;;
       split)
         shift 2
-        direction="-h"
+        # it2 semantics: -v = vertical divider (side by side), default = stacked.
+        # gx is the opposite (-v = split down), so translate.
+        direction="-v"
         target=""
         while [[ $# -gt 0 ]]; do
           case "$1" in
-            -v) direction="-v" ;;
+            -v) direction="-h" ;;
             -s) shift; target="$1" ;;
           esac
           shift
         done
-        if [[ -z "$target" ]]; then
-          target="focused"
-        elif ! is_uuid "$target"; then
-          # Not a UUID (e.g., fake leader ID) — resolve to focused
+        lead="${ITERM_SESSION_ID#*:}"
+        if is_uuid "$lead"; then
+          state=$(state_file "$lead")
+          lock "$state"
+          new_id=$(place_teammate "$lead"); rc=$?
+          unlock "$state"
+          (( rc == 0 )) || { echo "it2 shim: split failed" >&2; exit 1; }
+          echo "Created new pane: $new_id"
+          exit 0
+        fi
+        # No known lead: plain split as requested.
+        if [[ -z "$target" ]] || ! is_uuid "$target"; then
           target="focused"
         fi
         $GX split "$target" "$direction"
@@ -67,6 +176,16 @@ case "$1" in
         done
         if [[ -n "$target" ]]; then
           $GX close "$target" 2>/dev/null
+          # Rebalance the lead's tab and the overflow tab. Best effort.
+          lead="${ITERM_SESSION_ID#*:}"
+          if is_uuid "$lead"; then
+            state=$(state_file "$lead")
+            # Forget the closed pane so the ⅓ resize stops once a column empties.
+            [[ -f "$state" ]] && sed -i '' -e "/ $target\$/d" "$state"
+            rebalance "$lead"
+            [[ -f "$state" ]] && awk '$1=="tab" && $2!="'"$target"'"{print $2}' "$state" | head -1 |
+              while read -r t; do equalize "$t"; done
+          fi
         fi
         exit 0  # idempotent — always succeed (pane may already be gone)
         ;;
